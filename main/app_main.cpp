@@ -195,7 +195,7 @@ extern "C" void app_main(void) {
 
     // Вывод QR-кода и Manual pairing code в лог для комиссирования по BLE
     chip::RendezvousInformationFlags rendezvous(chip::RendezvousInformationFlag::kBLE);
-    chip::app::PrintOnboardingCodes(rendezvous);
+    PrintOnboardingCodes(rendezvous);
 
     ESP_LOGI(TAG, "Booted. Откройте приложение-дом (Apple/Google/HA) и добавьте устройство по QR/коду из лога.");
 
