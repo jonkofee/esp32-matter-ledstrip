@@ -2,3 +2,4 @@
 /managed_components/
 .idea
 sdkconfig.old
+.vscode

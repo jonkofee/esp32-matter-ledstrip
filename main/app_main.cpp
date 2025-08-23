@@ -1,204 +1,204 @@
-/*
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
+// main/app_main.cpp — ESP-Matter + WS2812B (ESP32), led_strip v3 (RMT)
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "nvs_flash.h"
+#include "esp_log.h"
+#include "led_strip.h"
+#include "led_strip_rmt.h"
 
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
-
-#include <esp_err.h>
-#include <esp_log.h>
-#include <nvs_flash.h>
-
-#include <esp_matter.h>
-#include <esp_matter_console.h>
-#include <esp_matter_ota.h>
-
-#include <common_macros.h>
-#include <log_heap_numbers.h>
-
-#include <app_priv.h>
-#include <app_reset.h>
-#if CHIP_DEVICE_CONFIG_ENABLE_THREAD
-#include <platform/ESP32/OpenthreadLauncher.h>
-#endif
-
-#include <app/server/CommissioningWindowManager.h>
-#include <app/server/Server.h>
-
-static const char *TAG = "app_main";
-uint16_t light_endpoint_id = 0;
+// esp-matter
+#include "esp_matter.h"
+#include "esp_matter_endpoint.h"
+#include "esp_matter_cluster.h"
+#include "esp_matter_attribute.h"
+#include <app/server/OnboardingCodesUtil.h>
 
 using namespace esp_matter;
-using namespace esp_matter::attribute;
 using namespace esp_matter::endpoint;
-using namespace chip::app::Clusters;
+using namespace chip::app::Clusters; // OnOff, LevelControl, ColorControl
 
-constexpr auto k_timeout_seconds = 300;
+static const char *TAG = "matter-ws2812";
 
-static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
-{
-    switch (event->Type) {
-    case chip::DeviceLayer::DeviceEventType::kInterfaceIpAddressChanged:
-        ESP_LOGI(TAG, "Interface IP Address changed");
-        break;
+// ===================== Настройки ленты =====================
+static constexpr gpio_num_t LED_PIN   = GPIO_NUM_18;  // Замените под вашу плату
+static constexpr uint16_t   LED_COUNT = 30;           // Длина ленты
 
-    case chip::DeviceLayer::DeviceEventType::kCommissioningComplete:
-        ESP_LOGI(TAG, "Commissioning complete");
-        break;
+static led_strip_handle_t s_strip = nullptr;
 
-    case chip::DeviceLayer::DeviceEventType::kFailSafeTimerExpired:
-        ESP_LOGI(TAG, "Commissioning failed, fail safe timer expired");
-        break;
+// ===================== Состояние света =====================
+struct Rgb { uint8_t r, g, b; };
+struct LightState {
+    bool     on = true;          // OnOff
+    uint8_t  level = 254;        // 0..254 (Matter CurrentLevel)
+    Rgb      rgb = {255, 180, 80};
+} g_light;
 
-    case chip::DeviceLayer::DeviceEventType::kCommissioningSessionStarted:
-        ESP_LOGI(TAG, "Commissioning session started");
-        break;
+static inline uint8_t clamp255(int v) { return (uint8_t)std::max(0, std::min(255, v)); }
 
-    case chip::DeviceLayer::DeviceEventType::kCommissioningSessionStopped:
-        ESP_LOGI(TAG, "Commissioning session stopped");
-        break;
-
-    case chip::DeviceLayer::DeviceEventType::kCommissioningWindowOpened:
-        ESP_LOGI(TAG, "Commissioning window opened");
-        break;
-
-    case chip::DeviceLayer::DeviceEventType::kCommissioningWindowClosed:
-        ESP_LOGI(TAG, "Commissioning window closed");
-        break;
-
-    case chip::DeviceLayer::DeviceEventType::kFabricRemoved:
-        {
-            ESP_LOGI(TAG, "Fabric removed successfully");
-            if (chip::Server::GetInstance().GetFabricTable().FabricCount() == 0)
-            {
-                chip::CommissioningWindowManager & commissionMgr = chip::Server::GetInstance().GetCommissioningWindowManager();
-                constexpr auto kTimeoutSeconds = chip::System::Clock::Seconds16(k_timeout_seconds);
-                if (!commissionMgr.IsCommissioningWindowOpen())
-                {
-                    /* After removing last fabric, this example does not remove the Wi-Fi credentials
-                     * and still has IP connectivity so, only advertising on DNS-SD.
-                     */
-                    CHIP_ERROR err = commissionMgr.OpenBasicCommissioningWindow(kTimeoutSeconds,
-                                                    chip::CommissioningWindowAdvertisement::kDnssdOnly);
-                    if (err != CHIP_NO_ERROR)
-                    {
-                        ESP_LOGE(TAG, "Failed to open commissioning window, err:%" CHIP_ERROR_FORMAT, err.Format());
-                    }
-                }
-            }
-        break;
-        }
-
-    case chip::DeviceLayer::DeviceEventType::kFabricWillBeRemoved:
-        ESP_LOGI(TAG, "Fabric will be removed");
-        break;
-
-    case chip::DeviceLayer::DeviceEventType::kFabricUpdated:
-        ESP_LOGI(TAG, "Fabric is updated");
-        break;
-
-    case chip::DeviceLayer::DeviceEventType::kFabricCommitted:
-        ESP_LOGI(TAG, "Fabric is committed");
-        break;
-
-    case chip::DeviceLayer::DeviceEventType::kBLEDeinitialized:
-        ESP_LOGI(TAG, "BLE deinitialized and memory reclaimed");
-        break;
-
-    default:
-        break;
-    }
+// HSV(0..254, 0..254, 0..254) -> RGB(0..255)
+static Rgb hsv_to_rgb(uint8_t h_in, uint8_t s_in, uint8_t v_in) {
+    float h = (float)h_in * 360.0f / 254.0f;
+    float s = (float)s_in / 254.0f;
+    float v = (float)v_in / 254.0f;
+    float c = v * s;
+    float x = c * (1 - fabsf(fmodf(h / 60.0f, 2) - 1));
+    float m = v - c;
+    float r=0,g=0,b=0;
+    if (h < 60)      { r=c; g=x; b=0; }
+    else if (h < 120){ r=x; g=c; b=0; }
+    else if (h < 180){ r=0; g=c; b=x; }
+    else if (h < 240){ r=0; g=x; b=c; }
+    else if (h < 300){ r=x; g=0; b=c; }
+    else             { r=c; g=0; b=x; }
+    return { clamp255((int)((r + m) * 255.0f)),
+             clamp255((int)((g + m) * 255.0f)),
+             clamp255((int)((b + m) * 255.0f)) };
 }
 
-// This callback is invoked when clients interact with the Identify Cluster.
-// In the callback implementation, an endpoint can identify itself. (e.g., by flashing an LED or light).
-static esp_err_t app_identification_cb(identification::callback_type_t type, uint16_t endpoint_id, uint8_t effect_id,
-                                       uint8_t effect_variant, void *priv_data)
-{
-    ESP_LOGI(TAG, "Identification callback: type: %u, effect: %u, variant: %u", type, effect_id, effect_variant);
+// CIE xy + яркость(level) -> RGB (sRGB, D65)
+static Rgb xy_to_rgb(uint16_t x_u16, uint16_t y_u16, uint8_t level_in) {
+    float x = (float)x_u16 / 65535.0f;
+    float y = (float)y_u16 / 65535.0f;
+    float Y = std::max(0.0f, std::min(1.0f, (float)level_in / 254.0f));
+    if (y < 1e-6f) return {0,0,0};
+    float X = (Y / y) * x;
+    float Z = (Y / y) * (1.0f - x - y);
+    // XYZ -> linear RGB (sRGB)
+    float r_lin =  3.2406f*X - 1.5372f*Y - 0.4986f*Z;
+    float g_lin = -0.9689f*X + 1.8758f*Y + 0.0415f*Z;
+    float b_lin =  0.0557f*X - 0.2040f*Y + 1.0570f*Z;
+    auto gamma = [](float u){
+        u = std::max(0.0f, u);
+        return (u <= 0.0031308f) ? 12.92f*u : 1.055f*powf(u, 1.0f/2.4f) - 0.055f;
+    };
+    return { clamp255((int)(gamma(r_lin)*255.0f)),
+             clamp255((int)(gamma(g_lin)*255.0f)),
+             clamp255((int)(gamma(b_lin)*255.0f)) };
+}
+
+static void apply_to_strip() {
+    if (!s_strip) return;
+    uint8_t scale = g_light.on ? g_light.level : 0; // 0..254
+    for (uint32_t i=0; i<LED_COUNT; ++i) {
+        uint8_t r = (uint8_t)((g_light.rgb.r * scale) / 254);
+        uint8_t g = (uint8_t)((g_light.rgb.g * scale) / 254);
+        uint8_t b = (uint8_t)((g_light.rgb.b * scale) / 254);
+        led_strip_set_pixel(s_strip, i, r, g, b);
+    }
+    led_strip_refresh(s_strip);
+}
+
+static void led_init() {
+    // v3-only init (RMT backend)
+    led_strip_config_t strip_config = {};
+    strip_config.strip_gpio_num = LED_PIN;
+    strip_config.max_leds = LED_COUNT;
+    strip_config.led_model = LED_MODEL_WS2812;
+    strip_config.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB; // WS2812B = GRB
+    strip_config.flags.invert_out = 0;
+
+    led_strip_rmt_config_t rmt_config = {};
+    rmt_config.clk_src = RMT_CLK_SRC_DEFAULT;
+    rmt_config.resolution_hz = 10 * 1000 * 1000;  // 10 MHz
+    rmt_config.mem_block_symbols = 64;            // default depth
+    rmt_config.flags.with_dma = 0;                // set 1 for long strips on S3
+
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &s_strip));
+
+    // Clear on boot
+    led_strip_clear(s_strip);
+}
+
+// ===================== Matter callbacks =====================
+static uint16_t s_light_endpoint_id = 0;
+
+static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16_t endpoint_id,
+                                         uint32_t cluster_id, uint32_t attribute_id,
+                                         esp_matter_attr_val_t *val, void *priv) {
+    if (type != attribute::PRE_UPDATE) return ESP_OK;
+    if (endpoint_id != s_light_endpoint_id) return ESP_OK;
+
+    if (cluster_id == OnOff::Id && attribute_id == OnOff::Attributes::OnOff::Id) {
+        g_light.on = val->val.b;
+        ESP_LOGI(TAG, "OnOff -> %d", g_light.on);
+        apply_to_strip();
+        return ESP_OK;
+    }
+    if (cluster_id == LevelControl::Id && attribute_id == LevelControl::Attributes::CurrentLevel::Id) {
+        g_light.level = val->val.u8; // 0..254
+        ESP_LOGI(TAG, "Level -> %u", g_light.level);
+        apply_to_strip();
+        return ESP_OK;
+    }
+    if (cluster_id == ColorControl::Id) {
+        if (attribute_id == ColorControl::Attributes::CurrentHue::Id) {
+            uint8_t hue = val->val.u8;
+            uint8_t sat = 254; // по умолчанию насыщенность 100%
+            g_light.rgb = hsv_to_rgb(hue, sat, 254);
+            ESP_LOGI(TAG, "Hue -> %u", hue);
+            apply_to_strip();
+            return ESP_OK;
+        } else if (attribute_id == ColorControl::Attributes::CurrentSaturation::Id) {
+            uint8_t sat = val->val.u8;
+            uint8_t approx_h = 0; // упрощение
+            g_light.rgb = hsv_to_rgb(approx_h, sat, 254);
+            ESP_LOGI(TAG, "Saturation -> %u", sat);
+            apply_to_strip();
+            return ESP_OK;
+        } else if (attribute_id == ColorControl::Attributes::CurrentX::Id ||
+                   attribute_id == ColorControl::Attributes::CurrentY::Id) {
+            // Получим обе XY (если пришла одна — вторая всё равно уже есть в БД)
+            endpoint_t *ep_h = endpoint::get(endpoint_id);
+            cluster_t *cc = cluster::get(ep_h, ColorControl::Id);
+            attribute_t *attr_x = attribute::get(cc, ColorControl::Attributes::CurrentX::Id);
+            attribute_t *attr_y = attribute::get(cc, ColorControl::Attributes::CurrentY::Id);
+            esp_matter_attr_val_t x_val = esp_matter_invalid(nullptr);
+            esp_matter_attr_val_t y_val = esp_matter_invalid(nullptr);
+            attribute::get_val(attr_x, &x_val);
+            attribute::get_val(attr_y, &y_val);
+            uint16_t x = x_val.val.u16;
+            uint16_t y = y_val.val.u16;
+            g_light.rgb = xy_to_rgb(x, y, g_light.level);
+            ESP_LOGI(TAG, "XY -> %u,%u", x, y);
+            apply_to_strip();
+            return ESP_OK;
+        }
+    }
     return ESP_OK;
 }
 
-// This callback is called for every attribute update. The callback implementation shall
-// handle the desired attributes and return an appropriate error code. If the attribute
-// is not of your interest, please do not return an error code and strictly return ESP_OK.
-static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16_t endpoint_id, uint32_t cluster_id,
-                                         uint32_t attribute_id, esp_matter_attr_val_t *val, void *priv_data)
-{
-    esp_err_t err = ESP_OK;
+extern "C" void app_main(void) {
+    ESP_ERROR_CHECK(nvs_flash_init());
+    led_init();
 
-    if (type == PRE_UPDATE) {
-        /* Driver update */
-        app_driver_handle_t driver_handle = (app_driver_handle_t)priv_data;
-        err = app_driver_attribute_update(driver_handle, endpoint_id, cluster_id, attribute_id, val);
+    // ====== Создаём узел и endpoint света ======
+    node::config_t node_cfg;
+    node_t *node = node::create(&node_cfg, app_attribute_update_cb, nullptr);
+    if (!node) {
+        ESP_LOGE(TAG, "Failed to create Matter node");
+        return;
     }
 
-    return err;
-}
+    extended_color_light::config_t light_cfg; // цветной светильник
+    light_cfg.on_off.on_off = g_light.on;
+    light_cfg.level_control.current_level = g_light.level; // стартовая яркость
 
-extern "C" void app_main()
-{
-    esp_err_t err = ESP_OK;
+    endpoint_t *ep = extended_color_light::create(node, &light_cfg, ENDPOINT_FLAG_NONE, nullptr);
+    s_light_endpoint_id = endpoint::get_id(ep);
+    ESP_LOGI(TAG, "Light endpoint id = %u", s_light_endpoint_id);
 
-    /* Initialize the ESP NVS layer */
-    nvs_flash_init();
+    // Запуск стека Matter
+    ESP_ERROR_CHECK(esp_matter::start(nullptr));
 
-    /* Initialize driver */
-    app_driver_handle_t light_handle = app_driver_light_init();
-    app_driver_handle_t button_handle = app_driver_button_init();
+    // Вывод QR-кода и Manual pairing code в лог для комиссирования по BLE
+    chip::RendezvousInformationFlags rendezvous(chip::RendezvousInformationFlag::kBLE);
+    chip::app::PrintOnboardingCodes(rendezvous);
 
-    /* Create a Matter node and add the mandatory Root Node device type on endpoint 0 */
-    node::config_t node_config;
-    node_t *node = node::create(&node_config, app_attribute_update_cb, app_identification_cb);
-    ABORT_APP_ON_FAILURE(node != nullptr, ESP_LOGE(TAG, "Failed to create Matter node"));
+    ESP_LOGI(TAG, "Booted. Откройте приложение-дом (Apple/Google/HA) и добавьте устройство по QR/коду из лога.");
 
-    extended_color_light::config_t light_config;
-    light_config.on_off.on_off = false;
-    light_config.on_off.features.lighting.start_up_on_off = nullptr;
-    light_config.on_off.feature_flags = cluster::on_off::feature::lighting::get_id();
-
-    // endpoint handles can be used to add/modify clusters.
-    endpoint_t *endpoint = extended_color_light::create(node, &light_config, ENDPOINT_FLAG_NONE, light_handle);
-    ABORT_APP_ON_FAILURE(endpoint != nullptr, ESP_LOGE(TAG, "Failed to create extended color light endpoint"));
-
-    light_endpoint_id = endpoint::get_id(endpoint);
-    ESP_LOGI(TAG, "Light created with endpoint_id %d", light_endpoint_id);
-
-    /* Mark deferred persistence for some attributes that might be changed rapidly */
-    attribute_t *current_level_attribute = attribute::get(light_endpoint_id, LevelControl::Id, LevelControl::Attributes::CurrentLevel::Id);
-    attribute::set_deferred_persistence(current_level_attribute);
-
-    attribute_t *current_x_attribute = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::CurrentX::Id);
-    attribute::set_deferred_persistence(current_x_attribute);
-    attribute_t *current_y_attribute = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::CurrentY::Id);
-    attribute::set_deferred_persistence(current_y_attribute);
-    attribute_t *color_temp_attribute = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::ColorTemperatureMireds::Id);
-    attribute::set_deferred_persistence(color_temp_attribute);
-
-#if CHIP_DEVICE_CONFIG_ENABLE_THREAD && CHIP_DEVICE_CONFIG_ENABLE_WIFI_STATION
-    // Enable secondary network interface
-    secondary_network_interface::config_t secondary_network_interface_config;
-    endpoint = endpoint::secondary_network_interface::create(node, &secondary_network_interface_config, ENDPOINT_FLAG_NONE, nullptr);
-    ABORT_APP_ON_FAILURE(endpoint != nullptr, ESP_LOGE(TAG, "Failed to create secondary network interface endpoint"));
-#endif
-
-
-#if CHIP_DEVICE_CONFIG_ENABLE_THREAD
-    /* Set OpenThread platform config */
-    esp_openthread_platform_config_t config = {
-        .radio_config = ESP_OPENTHREAD_DEFAULT_RADIO_CONFIG(),
-        .host_config = ESP_OPENTHREAD_DEFAULT_HOST_CONFIG(),
-        .port_config = ESP_OPENTHREAD_DEFAULT_PORT_CONFIG(),
-    };
-    set_openthread_platform_config(&config);
-#endif
-
-    /* Matter start */
-    err = esp_matter::start(app_event_cb);
-    ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to start Matter, err:%d", err));
-
-    /* Starting driver with default values */
-    app_driver_light_set_defaults(light_endpoint_id);
-
+    // Показать текущий цвет/яркость
+    apply_to_strip();
 }
