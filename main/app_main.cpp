@@ -79,6 +79,35 @@ static Rgb xy_to_rgb(uint16_t x_u16, uint16_t y_u16, uint8_t level_in) {
              clamp255((int)(gamma(b_lin)*255.0f)) };
 }
 
+// Mireds (1e6/K) -> xy (аппроксимация Питерса, годится для 2000–6500K)
+static void mired_to_xy(uint16_t mired, uint16_t &out_x_u16, uint16_t &out_y_u16) {
+    float K = 1000000.0f / std::max<uint16_t>(mired, 1); // защита от 0
+    K = std::max(1000.0f, std::min(25000.0f, K));
+    float x;
+    if (K >= 1667.0f && K <= 4000.0f) {
+        x = -0.2661239e9f/(K*K*K) - 0.2343580e6f/(K*K) + 0.8776956e3f/K + 0.179910f;
+    } else {
+        x = -3.0258469e9f/(K*K*K) + 2.1070379e6f/(K*K) + 0.2226347e3f/K + 0.240390f;
+    }
+    float y;
+    if (K >= 1667.0f && K <= 2222.0f) {
+        y = -1.1063814f*(x*x*x) - 1.34811020f*(x*x) + 2.18555832f*x - 0.20219683f;
+    } else if (K <= 4000.0f) {
+        y = -0.9549476f*(x*x*x) - 1.37418593f*(x*x) + 2.09137015f*x - 0.16748867f;
+    } else {
+        y = 3.0817580f*(x*x*x) - 5.87338670f*(x*x) + 3.75112997f*x - 0.37001483f;
+    }
+    // вернём как 0..65535
+    out_x_u16 = (uint16_t)std::max(0, std::min(65535, (int)std::round(x * 65535.0f)));
+    out_y_u16 = (uint16_t)std::max(0, std::min(65535, (int)std::round(y * 65535.0f)));
+}
+
+static Rgb ct_mired_to_rgb(uint16_t mired, uint8_t level_in) {
+    uint16_t x, y;
+    mired_to_xy(mired, x, y);
+    return xy_to_rgb(x, y, level_in);
+}
+
 static void apply_to_strip() {
     if (!s_strip) return;
     uint8_t scale = g_light.on ? g_light.level : 0; // 0..254
@@ -148,6 +177,12 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
             ESP_LOGI(TAG, "Saturation -> %u", sat);
             apply_to_strip();
             return ESP_OK;
+        } else if (attribute_id == ColorControl::Attributes::ColorTemperatureMireds::Id) {
+            uint16_t mired = val->val.u16; // 153..500 типично
+            g_light.rgb = ct_mired_to_rgb(mired, g_light.level);
+            ESP_LOGI(TAG, "CT (mireds) -> %u", mired);
+            apply_to_strip();
+            return ESP_OK;
         } else if (attribute_id == ColorControl::Attributes::CurrentX::Id ||
                    attribute_id == ColorControl::Attributes::CurrentY::Id) {
             // Получим обе XY (если пришла одна — вторая всё равно уже есть в БД)
@@ -185,17 +220,39 @@ extern "C" void app_main(void) {
     extended_color_light::config_t light_cfg; // цветной светильник
     light_cfg.on_off.on_off = g_light.on;
     light_cfg.level_control.current_level = g_light.level; // стартовая яркость
+    // По умолчанию показываем режим цвета (HS), но поддерживаем и XY, и CT
+    light_cfg.color_control.color_mode = (uint8_t)ColorControl::ColorMode::kCurrentHueAndCurrentSaturation;
+    light_cfg.color_control.enhanced_color_mode = (uint8_t)ColorControl::ColorMode::kCurrentHueAndCurrentSaturation;
+    light_cfg.color_control.color_temperature.startup_color_temperature_mireds = nullptr; // сохранять прошлое при ребуте
 
     endpoint_t *ep = extended_color_light::create(node, &light_cfg, ENDPOINT_FLAG_NONE, nullptr);
+
+    // Явно включим все нужные фичи Color Control: HS + XY + CT
+    {
+        cluster_t *cc = cluster::get(ep, ColorControl::Id);
+        // FeatureMap (битовая маска): 0-HS, 3-XY, 4-CT
+        attribute_t *attr_feature = attribute::get(cc, ColorControl::Attributes::FeatureMap::Id);
+        uint32_t feature_bits = (1u << 0) | (1u << 3) | (1u << 4);
+        esp_matter_attr_val_t fval = esp_matter_uint32(feature_bits);
+        attribute::set_val(attr_feature, &fval);
+        // ColorCapabilities (та же маска, чаще читается контроллерами)
+        attribute_t *attr_caps = attribute::get(cc, ColorControl::Attributes::ColorCapabilities::Id);
+        uint16_t caps_bits = (1u << 0) | (1u << 3) | (1u << 4);
+        esp_matter_attr_val_t cval = esp_matter_uint16(caps_bits);
+        attribute::set_val(attr_caps, &cval);
+        // Границы CT для корректной работы адаптива и слайдера температуры
+        attribute_t *attr_ct_min = attribute::get(cc, ColorControl::Attributes::ColorTempPhysicalMinMireds::Id);
+        attribute_t *attr_ct_max = attribute::get(cc, ColorControl::Attributes::ColorTempPhysicalMaxMireds::Id);
+        esp_matter_attr_val_t vmin = esp_matter_uint16(153); // ~6500K
+        esp_matter_attr_val_t vmax = esp_matter_uint16(500); // ~2000K
+        attribute::set_val(attr_ct_min, &vmin);
+        attribute::set_val(attr_ct_max, &vmax);
+    }
     s_light_endpoint_id = endpoint::get_id(ep);
     ESP_LOGI(TAG, "Light endpoint id = %u", s_light_endpoint_id);
 
     // Запуск стека Matter
     ESP_ERROR_CHECK(esp_matter::start(nullptr));
-
-    // Вывод QR-кода и Manual pairing code в лог для комиссирования по BLE
-    chip::RendezvousInformationFlags rendezvous(chip::RendezvousInformationFlag::kBLE);
-    PrintOnboardingCodes(rendezvous);
 
     ESP_LOGI(TAG, "Booted. Откройте приложение-дом (Apple/Google/HA) и добавьте устройство по QR/коду из лога.");
 
