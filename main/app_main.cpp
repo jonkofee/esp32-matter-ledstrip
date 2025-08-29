@@ -20,6 +20,11 @@
 #include "led_strip.h"
 #include "led_strip_rmt.h"
 
+#define LED_STRIP_GPIO_PIN  2
+#define LED_STRIP_LED_COUNT 144 * 2
+// 10MHz resolution, 1 tick = 0.1us (led strip needs a high resolution)
+#define LED_STRIP_RMT_RES_HZ  (10 * 1000 * 1000)
+
 #if CHIP_DEVICE_CONFIG_ENABLE_THREAD
 #include <platform/ESP32/OpenthreadLauncher.h>
 #endif
@@ -150,26 +155,28 @@ static inline uint8_t scale_u8(uint8_t v, uint8_t lvl)
 
 static void led_init()
 {
+    // LED strip general initialization, according to your led board design
     led_strip_config_t strip_config = {
-        .strip_gpio_num = (gpio_num_t)18,  // change if needed
-        .max_leds = 30,
-        .led_model = LED_MODEL_WS2812,
-        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
-        .flags = { .invert_out = 0 }
+        .strip_gpio_num = LED_STRIP_GPIO_PIN, // The GPIO that connected to the LED strip's data line
+        .max_leds = LED_STRIP_LED_COUNT,      // The number of LEDs in the strip,
+        .led_model = LED_MODEL_WS2812,        // LED strip model
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB, // The color order of the strip: GRB
+        .flags = {
+            .invert_out = false, // don't invert the output signal
+        }
     };
+
+    // LED strip backend configuration: RMT
     led_strip_rmt_config_t rmt_config = {
-        .clk_src = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz = 10 * 1000 * 1000, // 10 MHz
-        .mem_block_symbols = 64,
-        .flags = { .with_dma = 0 }
+        .clk_src = RMT_CLK_SRC_DEFAULT,        // different clock source can lead to different power consumption
+        .resolution_hz = LED_STRIP_RMT_RES_HZ, // RMT counter clock frequency
+        .mem_block_symbols = 0, // the memory block size used by the RMT channel
+        .flags = {
+            .with_dma = 0,     // Using DMA can improve performance when driving more LEDs
+        }
     };
-    esp_err_t err = led_strip_new_rmt_device(&strip_config, &rmt_config, &s_strip);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "WS2812 init failed: %d", err);
-        return;
-    }
-    led_strip_clear(s_strip);
-    led_strip_refresh(s_strip);
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &s_strip));
+    ESP_LOGI(TAG, "Created LED strip object with RMT backend");
 }
 
 static void apply_light()
@@ -178,7 +185,6 @@ static void apply_light()
 
     if (!g_light.on || g_light.level == 0) {
         led_strip_clear(s_strip);
-        led_strip_refresh(s_strip);
         return;
     }
 
@@ -186,7 +192,7 @@ static void apply_light()
     const uint8_t g = scale_u8(g_light.rgb.g, g_light.level);
     const uint8_t b = scale_u8(g_light.rgb.b, g_light.level);
 
-    for (int i = 0; i < 30; ++i) {
+    for (int i = 0; i < LED_STRIP_LED_COUNT; ++i) {
         led_strip_set_pixel(s_strip, i, r, g, b);
     }
     led_strip_refresh(s_strip);
