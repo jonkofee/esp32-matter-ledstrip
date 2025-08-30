@@ -280,51 +280,52 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
                                          uint32_t attribute_id, esp_matter_attr_val_t *val, void *priv_data)
 {
     if (endpoint_id != light_endpoint_id) return ESP_OK;
+    if (type != PRE_UPDATE) return ESP_OK;
 
-    if (type == PRE_UPDATE) {
-        if (cluster_id == OnOff::Id && attribute_id == OnOff::Attributes::OnOff::Id) {
-            g_light.on = val->val.b;
-            apply_light();
-        } else if (cluster_id == LevelControl::Id && attribute_id == LevelControl::Attributes::CurrentLevel::Id) {
-            g_light.level = val->val.u8;
-            apply_light();
-        } else if (cluster_id == ColorControl::Id) {
-            if (attribute_id == ColorControl::Attributes::CurrentHue::Id ||
-                attribute_id == ColorControl::Attributes::CurrentSaturation::Id) {
-                // HS update
-                uint8_t h = 0, s = 0;
-                esp_matter_attr_val_t vh, vs;
-                if (auto *ah = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::CurrentHue::Id)) {
-                    attribute::get_val(ah, &vh); h = vh.val.u8;
-                }
-                if (auto *as = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::CurrentSaturation::Id)) {
-                    attribute::get_val(as, &vs); s = vs.val.u8;
-                }
-                g_light.rgb = hsv_to_rgb_u8(h, s);
-                apply_light();
-            } else if (attribute_id == ColorControl::Attributes::CurrentX::Id ||
-                       attribute_id == ColorControl::Attributes::CurrentY::Id) {
-                // XY update
-                uint16_t x16 = 0, y16 = 0;
-                esp_matter_attr_val_t vx, vy;
-                if (auto *ax = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::CurrentX::Id)) {
-                    attribute::get_val(ax, &vx); x16 = vx.val.u16;
-                }
-                if (auto *ay = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::CurrentY::Id)) {
-                    attribute::get_val(ay, &vy); y16 = vy.val.u16;
-                }
-                g_light.rgb = xy_to_rgb_u8(x16, y16);
-                apply_light();
-            } else if (attribute_id == ColorControl::Attributes::ColorTemperatureMireds::Id) {
-                // CCT update
-                uint16_t mireds = 0;
-                esp_matter_attr_val_t vt;
-                if (auto *at = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::ColorTemperatureMireds::Id)) {
-                    attribute::get_val(at, &vt); mireds = vt.val.u16;
-                }
-                g_light.rgb = cct_mireds_to_rgb_u8(mireds);
-                apply_light();
+    if (cluster_id == OnOff::Id && attribute_id == OnOff::Attributes::OnOff::Id) {
+        g_light.on = val->val.b;
+        apply_light();
+    } else if (cluster_id == LevelControl::Id && attribute_id == LevelControl::Attributes::CurrentLevel::Id) {
+        //Костыль для чтобы лента не блымала
+        if (val->val.u8 == 1) return ESP_OK;
+        g_light.level = val->val.u8;
+        apply_light();
+    } else if (cluster_id == ColorControl::Id) {
+        if (attribute_id == ColorControl::Attributes::CurrentHue::Id ||
+            attribute_id == ColorControl::Attributes::CurrentSaturation::Id) {
+            // HS update
+            uint8_t h = 0, s = 0;
+            esp_matter_attr_val_t vh, vs;
+            if (auto *ah = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::CurrentHue::Id)) {
+                attribute::get_val(ah, &vh); h = vh.val.u8;
             }
+            if (auto *as = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::CurrentSaturation::Id)) {
+                attribute::get_val(as, &vs); s = vs.val.u8;
+            }
+            g_light.rgb = hsv_to_rgb_u8(h, s);
+            apply_light();
+        } else if (attribute_id == ColorControl::Attributes::CurrentX::Id ||
+                    attribute_id == ColorControl::Attributes::CurrentY::Id) {
+            // XY update
+            uint16_t x16 = 0, y16 = 0;
+            esp_matter_attr_val_t vx, vy;
+            if (auto *ax = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::CurrentX::Id)) {
+                attribute::get_val(ax, &vx); x16 = vx.val.u16;
+            }
+            if (auto *ay = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::CurrentY::Id)) {
+                attribute::get_val(ay, &vy); y16 = vy.val.u16;
+            }
+            g_light.rgb = xy_to_rgb_u8(x16, y16);
+            apply_light();
+        } else if (attribute_id == ColorControl::Attributes::ColorTemperatureMireds::Id) {
+            // CCT update
+            uint16_t mireds = 0;
+            esp_matter_attr_val_t vt;
+            if (auto *at = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::ColorTemperatureMireds::Id)) {
+                attribute::get_val(at, &vt); mireds = vt.val.u16;
+            }
+            g_light.rgb = cct_mireds_to_rgb_u8(mireds);
+            apply_light();
         }
     }
 
